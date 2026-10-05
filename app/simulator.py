@@ -6,6 +6,10 @@
 
 全局调度规则：从各事务队头依次取一条操作（轮转调度，事务结束后跳过），
 三种隔离级别共用同一份调度，保证差异只来自隔离语义。
+
+另支持调度对照：同一组脚本可改用调用方给定的执行顺序（由事务名组成，
+每次取对应事务尚未执行的队头操作），与默认轮转各自独立推演后，
+按（事务名，事务内操作序号）对齐 READ / COMMIT / ABORT 比较差异。
 """
 
 from __future__ import annotations
@@ -175,6 +179,52 @@ def build_schedule(txns: List[Txn]) -> List[Tuple[str, Tuple[str, Optional[str],
     return schedule
 
 
+def parse_order(raw: Any) -> List[str]:
+    """解析自定义执行顺序：分隔字符串（空格/逗号/顿号等）或事务名数组。
+
+    返回大写事务名列表；具体合法性（未知事务、次数与脚本操作数不符）
+    由 run_compare 校验。
+    """
+    if isinstance(raw, str):
+        text = raw
+        for ch in (",", "，", "、", ";", "；", "|", "/"):
+            text = text.replace(ch, " ")
+        tokens = text.split()
+    elif isinstance(raw, (list, tuple)):
+        tokens = []
+        for item in raw:
+            tok = str(item).strip()
+            if tok:
+                tokens.append(tok)
+    else:
+        raise SimError("执行顺序格式错误：应为分隔字符串或事务名数组")
+    order = [t.upper() for t in tokens]
+    if not order:
+        raise SimError("执行顺序不能为空")
+    return order
+
+
+def build_custom_schedule(
+    txns: List[Txn],
+    order: List[str],
+) -> List[Tuple[str, Tuple[str, Optional[str], Optional[Any]]]]:
+    """自定义顺序调度：按给定事务名序列，每次取对应事务尚未执行的队头操作。
+
+    未知事务与次数校验已在 run_compare 中完成，这里保留防御性检查。
+    """
+    by_name = {t.name: t for t in txns}
+    schedule: List[Tuple[str, Tuple[str, Optional[str], Optional[Any]]]] = []
+    for i, name in enumerate(order, start=1):
+        t = by_name.get(name)
+        if t is None:
+            raise SimError(f"执行顺序第 {i} 项：未知事务 “{name}”")
+        if t.pc >= len(t.ops):
+            raise SimError(f"执行顺序第 {i} 项：{name} 的操作已全部取完")
+        schedule.append((t.name, t.ops[t.pc]))
+        t.pc += 1
+    return schedule
+
+
 def _initial_version(vid: int, key: str, value: Any) -> Version:
     return Version(vid=vid, key=key, value=value, kind="initial",
                    writer="INIT", wseq=None, cseq=0)
@@ -271,8 +321,13 @@ def _snapshot_dict(t: Txn) -> Dict[str, dict]:
 
 def simulate(mode: str,
              initial: "OrderedDict[str, Any]",
-             txn_scripts: List[Tuple[str, str]]) -> dict:
-    """对单个隔离级别执行完整推演。"""
+             txn_scripts: List[Tuple[str, str]],
+             order: Optional[List[str]] = None) -> dict:
+    """对单个隔离级别执行完整推演。
+
+    order 为 None 时使用默认轮转调度；否则按给定事务名顺序，
+    每次取对应事务尚未执行的队头操作。
+    """
     if mode not in ("RU", "RC", "SI"):
         raise SimError(f"未知隔离级别 {mode}")
 
@@ -281,7 +336,10 @@ def simulate(mode: str,
         txns[name] = Txn(name=name, ops=parse_txn(name, text))
     txn_list = list(txns.values())
 
-    schedule = build_schedule(txn_list)
+    if order is None:
+        schedule = build_schedule(txn_list)
+    else:
+        schedule = build_custom_schedule(txn_list, order)
 
     # 重置调度游标造成的状态：Txn 刚构造时 pc 已被 build_schedule 推到末尾，
     # 重新初始化一个干净的执行环境。
@@ -816,4 +874,135 @@ def run_all(initial_text: str, txn_texts: List[str]) -> dict:
         "initial": {k: v for k, v in initial.items()},
         "results": {mode: simulate(mode, initial, txn_scripts)
                     for mode in ("RU", "RC", "SI")},
+    }
+
+
+# ---------------------------------------------------------------------------
+# 调度对照：默认轮转 vs 自定义顺序
+# ---------------------------------------------------------------------------
+
+
+def _align_keys(schedule: List[dict]) -> List[Tuple[str, int]]:
+    """每个调度步的对齐键：（事务名，事务内操作序号），序号从 1 开始。"""
+    counts: Dict[str, int] = {}
+    keys: List[Tuple[str, int]] = []
+    for item in schedule:
+        name = item["txn"]
+        counts[name] = counts.get(name, 0) + 1
+        keys.append((name, counts[name]))
+    return keys
+
+
+def _diff_results(default_res: dict, custom_res: dict) -> dict:
+    """按（事务名，事务内操作序号）对齐 READ / COMMIT / ABORT，
+    依默认轮转的步序比较读值、来源类型、写入者与结束状态。
+
+    两侧调度包含完全相同的多重操作集合（仅顺序不同），对齐键一一对应；
+    各字段均取各侧实际运行结果——例如 SI 因顺序变化回滚后，
+    后续 READ 的读值天然就是该侧真实推演出的值。
+    """
+    cindex = {k: i for i, k in enumerate(_align_keys(custom_res["schedule"]))}
+
+    diffs: List[dict] = []
+    for i, akey in enumerate(_align_keys(default_res["schedule"])):
+        dstep = default_res["steps"][i]
+        op = dstep["op"]
+        if op not in ("READ", "COMMIT", "ABORT"):
+            continue
+        cstep = custom_res["steps"][cindex[akey]]
+        fields: List[dict] = []
+        if op == "READ":
+            for f, label in (("read_value", "读值"),
+                             ("read_source", "来源类型"),
+                             ("read_writer", "写入者")):
+                if dstep[f] != cstep[f]:
+                    fields.append({"field": f, "label": label,
+                                   "default": dstep[f], "custom": cstep[f]})
+        elif dstep["txn_status_after"] != cstep["txn_status_after"]:
+            fields.append({"field": "txn_status_after", "label": "结束状态",
+                           "default": dstep["txn_status_after"],
+                           "custom": cstep["txn_status_after"]})
+        if fields:
+            diffs.append({
+                "txn": akey[0],
+                "op_index": akey[1],
+                "op": op,
+                "key": dstep["key"],
+                "default_seq": dstep["seq"],
+                "custom_seq": cstep["seq"],
+                "default_read_vid": dstep["read_vid"],
+                "custom_read_vid": cstep["read_vid"],
+                "fields": fields,
+            })
+    return {
+        "identical": not diffs,
+        "diff_count": len(diffs),
+        "first_diff": diffs[0] if diffs else None,
+        "diffs": diffs,
+    }
+
+
+def _side_summary(res: dict) -> dict:
+    return {
+        "dirty_count": len(res["dirty_reads"]),
+        "has_cycle": res["graph"]["has_cycle"],
+        "cycles": [c["label"] for c in res["graph"]["cycles"]],
+    }
+
+
+def run_compare(initial_text: str, txn_texts: List[str], order_raw: Any) -> dict:
+    """同一组事务脚本的调度对照：默认轮转 vs 自定义顺序。
+
+    两侧各自独立运行 RU / RC / SI，再按（事务名，事务内操作序号）
+    对齐 READ / COMMIT / ABORT，依默认轮转的步序找出读值、来源类型、
+    写入者或结束状态的首次差异。
+    """
+    initial = parse_initial(initial_text)
+    if not 2 <= len(txn_texts) <= 3:
+        raise SimError("需要 2~3 条事务脚本")
+    txn_scripts = [(f"T{i+1}", text) for i, text in enumerate(txn_texts)]
+    names = [n for n, _ in txn_scripts]
+    if len(set(names)) != len(names):
+        raise SimError("事务名重复")
+
+    # 先校验脚本语法，再校验顺序：未知事务、各事务出现次数与脚本操作数不符
+    parsed = {n: parse_txn(n, text) for n, text in txn_scripts}
+    order = parse_order(order_raw)
+    counts = {n: 0 for n in names}
+    for i, name in enumerate(order, start=1):
+        if name not in counts:
+            raise SimError(
+                f"执行顺序第 {i} 项：未知事务 “{name}”，当前只有 {'、'.join(names)}"
+            )
+        counts[name] += 1
+    mismatches = [
+        f"{n} 出现 {counts[n]} 次，但脚本有 {len(parsed[n])} 条操作"
+        for n in names
+        if counts[n] != len(parsed[n])
+    ]
+    if mismatches:
+        raise SimError("执行顺序与脚本操作数不符：" + "；".join(mismatches))
+
+    default_results = {m: simulate(m, initial, txn_scripts)
+                       for m in ("RU", "RC", "SI")}
+    custom_results = {m: simulate(m, initial, txn_scripts, order)
+                      for m in ("RU", "RC", "SI")}
+
+    compare = {}
+    for m in ("RU", "RC", "SI"):
+        entry = _diff_results(default_results[m], custom_results[m])
+        entry["summary"] = {
+            "default": _side_summary(default_results[m]),
+            "custom": _side_summary(custom_results[m]),
+        }
+        compare[m] = entry
+
+    return {
+        "initial": {k: v for k, v in initial.items()},
+        "order": order,
+        "sides": {
+            "default": {"label": "默认轮转", "results": default_results},
+            "custom": {"label": "自定义顺序", "results": custom_results},
+        },
+        "compare": compare,
     }

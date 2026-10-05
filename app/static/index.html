@@ -179,12 +179,33 @@
   .placeholder { color: var(--muted); text-align: center; padding: 40px 10px; font-size: 13px; }
   .examples-row { display: flex; gap: 8px; flex-wrap: wrap; }
   .ex-desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  /* 调度对照 */
+  .order-area { margin-top: 16px; border-top: 1px dashed var(--line); padding-top: 12px; }
+  .order-area textarea { min-height: 44px; }
+  .cmp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  @media (max-width: 1100px) { .cmp-grid { grid-template-columns: 1fr; } }
+  .cmp-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 13px; }
+  .cmp-card h3 { margin: 0 0 8px; font-size: 13px; color: #cdd9ee; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cmp-diff { border-radius: 6px; padding: 8px 10px; font-size: 12px; margin-bottom: 8px; line-height: 1.6; }
+  .cmp-diff.same { background: rgba(70,201,143,.08); border: 1px solid rgba(70,201,143,.4); color: #9be8c6; }
+  .cmp-diff.diff { background: rgba(239,107,107,.09); border: 1px solid rgba(239,107,107,.5); color: #ffc9c9; }
+  .cmp-diff .f { font-family: var(--mono); }
+  .cmp-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .cmp-side { background: #0d1320; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 12px; }
+  .cmp-side .st { font-weight: 700; margin-bottom: 4px; color: #cdd9ee; }
+  .cmp-side ul { margin: 4px 0 0; padding-left: 16px; }
+  .cmp-side li { font-family: var(--mono); font-size: 11px; margin-bottom: 2px; }
+  details.cmp-all { margin-top: 6px; }
+  details.cmp-all summary { cursor: pointer; color: #e0a0a0; font-size: 11px; }
+  details.cmp-all ul { margin: 6px 0 0; padding-left: 16px; }
+  details.cmp-all li { font-size: 11px; margin-bottom: 3px; }
+  .chip.firstdiff { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); color: #ffb0b0; }
 </style>
 </head>
 <body>
 <header>
   <h1>事务交错推演（Transaction Interleaving Playground）</h1>
-  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图。</p>
+  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图；也可输入自定义执行顺序，与默认轮转做调度对照。</p>
 </header>
 <main>
   <section class="panel">
@@ -200,6 +221,18 @@ y=0</textarea>
           <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;cursor:pointer">
             <input type="checkbox" id="enableT3"> 启用 T3
           </label>
+        </div>
+        <div class="order-area">
+          <label class="field" for="orderInput">调度对照 · 自定义执行顺序（由 T1/T2/T3 组成，空格或逗号分隔；每项取该事务尚未执行的队头操作，需恰好覆盖全部操作）</label>
+          <textarea id="orderInput" rows="2" spellcheck="false" placeholder="例如：T1 T2 T1 T2 T1 T2 …"></textarea>
+          <div class="actions" style="margin-top:8px">
+            <button class="order-add" data-name="T1">+ T1</button>
+            <button class="order-add" data-name="T2">+ T2</button>
+            <button class="order-add" data-name="T3">+ T3</button>
+            <button id="fillOrderBtn">填入轮转顺序</button>
+            <button id="clearOrderBtn">清空</button>
+            <button class="primary" id="compareBtn">⇄ 对照推演</button>
+          </div>
         </div>
         <div class="error-box" id="errorBox"></div>
       </div>
@@ -228,6 +261,16 @@ y=0</textarea>
   </section>
 
   <section id="resultSection" style="display:none">
+    <div class="panel" id="comparePanel" style="display:none">
+      <h2>调度对照：默认轮转 ↔ 自定义顺序</h2>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+        自定义顺序：<code id="cmpOrderText"></code><br>
+        两侧各自独立运行 RU / RC / SI，按「事务名 + 事务内操作序号」对齐 READ / COMMIT / ABORT，
+        依默认轮转的步序标出读值、来源类型、写入者与结束状态的首次差异；下方可切换查看两侧逐步轨迹。
+      </div>
+      <div class="cmp-grid" id="compareSummary"></div>
+    </div>
+    <div class="tabs" id="sideTabs" style="display:none"></div>
     <div class="tabs" id="tabs"></div>
     <div class="panel">
       <div class="toolbar">
@@ -263,7 +306,8 @@ y=0</textarea>
     </div>
   </section>
   <section id="emptyHint" class="panel placeholder">
-    配置好脚本后点击「生成调度并推演」。三种隔离级别使用同一份全局调度，结果并排可比。
+    配置好脚本后点击「生成调度并推演」，三种隔离级别共用默认轮转调度、结果并排可比；
+    或填写自定义执行顺序后点击「对照推演」，与默认轮转逐侧对比。
   </section>
 </main>
 
@@ -326,7 +370,7 @@ const EXAMPLES = [
   }
 ];
 
-const state = { data: null, mode: "RU", idx: 0, timer: null };
+const state = { data: null, cmp: null, view: "single", side: "custom", mode: "RU", idx: 0, timer: null };
 
 const $ = id => document.getElementById(id);
 
@@ -363,6 +407,7 @@ function loadExample(i) {
   $("t2").value = ex.txns[1];
   $("t3").value = ex.txns[2] || "";
   hideError();
+  fillDefaultOrder();
   run();
 }
 
@@ -370,10 +415,18 @@ function loadExample(i) {
 // 请求
 // ---------------------------------------------------------------------------
 
+function collectTxns() {
+  const list = [
+    { name: "T1", text: $("t1").value },
+    { name: "T2", text: $("t2").value }
+  ];
+  if ($("enableT3").checked) list.push({ name: "T3", text: $("t3").value });
+  return list;
+}
+
 async function run() {
   stopPlay();
-  const txns = [$("t1").value, $("t2").value];
-  if ($("enableT3").checked) txns.push($("t3").value);
+  const txns = collectTxns().map(t => t.text);
   if (txns.some(t => !t.trim())) {
     return showError("T1、T2（以及启用时的 T3）脚本都不能为空。");
   }
@@ -393,12 +446,96 @@ async function run() {
   }
   hideError();
   state.data = data;
+  state.cmp = null;
+  state.view = "single";
   state.mode = "RU";
   state.idx = 0;
   $("emptyHint").style.display = "none";
   $("resultSection").style.display = "";
+  $("comparePanel").style.display = "none";
+  $("sideTabs").style.display = "none";
   renderTabs();
   render();
+}
+
+// 与后端轮转调度一致：按事务顺序循环，每轮取各事务队头一条操作
+function fillDefaultOrder() {
+  const txns = collectTxns();
+  const remaining = txns.map(t => t.text.split("\n").filter(l => l.trim()).length);
+  const names = txns.map(t => t.name);
+  const alive = new Set(names.filter((_, i) => remaining[i] > 0));
+  const out = [];
+  while (alive.size) {
+    let progressed = false;
+    names.forEach((n, i) => {
+      if (!alive.has(n)) return;
+      if (remaining[i] > 0) {
+        out.push(n);
+        remaining[i]--;
+        progressed = true;
+        if (remaining[i] === 0) alive.delete(n);
+      }
+    });
+    if (!progressed) break;
+  }
+  $("orderInput").value = out.join(" ");
+}
+
+async function runCompare() {
+  stopPlay();
+  const txns = collectTxns().map(t => t.text);
+  if (txns.some(t => !t.trim())) {
+    return showError("T1、T2（以及启用时的 T3）脚本都不能为空。");
+  }
+  const order = $("orderInput").value.trim();
+  if (!order) {
+    return showError("请填写自定义执行顺序（由 T1/T2/T3 组成，需恰好覆盖各事务全部操作）。");
+  }
+  let resp;
+  try {
+    resp = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial: $("initial").value, txns, order })
+    });
+  } catch (e) {
+    return showError("网络错误：" + e.message);
+  }
+  const data = await resp.json();
+  if (!resp.ok) {
+    clearCompare();  // 提示错误并清除页面旧对照
+    return showError(data.detail || "对照推演失败");
+  }
+  hideError();
+  state.cmp = data;
+  state.view = "compare";
+  state.side = "custom";
+  state.mode = "RU";
+  state.idx = 0;
+  $("emptyHint").style.display = "none";
+  $("resultSection").style.display = "";
+  $("comparePanel").style.display = "";
+  renderCompareSummary();
+  renderSideTabs();
+  renderTabs();
+  render();
+}
+
+function clearCompare() {
+  state.cmp = null;
+  $("comparePanel").style.display = "none";
+  $("sideTabs").style.display = "none";
+  if (state.view === "compare") {
+    state.view = "single";
+    if (state.data) {
+      state.idx = 0;
+      renderTabs();
+      render();
+    } else {
+      $("resultSection").style.display = "none";
+      $("emptyHint").style.display = "";
+    }
+  }
 }
 
 function showError(msg) {
@@ -415,8 +552,10 @@ function hideError() { $("errorBox").style.display = "none"; }
 function renderTabs() {
   const tabs = $("tabs");
   tabs.innerHTML = "";
+  const results = currentResults();
+  if (!results) return;
   for (const m of ["RU", "RC", "SI"]) {
-    const g = state.data.results[m].graph;
+    const g = results[m].graph;
     const div = document.createElement("div");
     div.className = "tab" + (m === state.mode ? " active" : "");
     div.innerHTML = `${esc(MODE_LABEL[m])}` +
@@ -427,12 +566,96 @@ function renderTabs() {
   }
 }
 
+// 对照视图下的两侧切换：默认轮转 / 自定义顺序
+function renderSideTabs() {
+  const el = $("sideTabs");
+  if (state.view !== "compare" || !state.cmp) {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  el.style.display = "flex";
+  el.innerHTML = "";
+  [["default", "默认轮转顺序"], ["custom", "自定义顺序"]].forEach(([side, label]) => {
+    const div = document.createElement("div");
+    div.className = "tab" + (state.side === side ? " active" : "");
+    div.textContent = label;
+    div.onclick = () => { stopPlay(); state.side = side; renderSideTabs(); renderTabs(); render(); };
+    el.appendChild(div);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 对照摘要
+// ---------------------------------------------------------------------------
+
+function fieldValLabel(field, v) {
+  if (field === "read_source") return sourceLabel(v);
+  if (field === "txn_status_after") return statusLabel(v);
+  if (field === "read_writer") return v === "INIT" ? "初始数据" : (v == null ? "∅" : esc(v));
+  return esc(fmt(v));
+}
+
+function diffLine(d) {
+  const opText = d.op === "READ" ? `READ ${d.key}` : d.op;
+  const fields = d.fields.map(f =>
+    `${f.label} <span class="f">${fieldValLabel(f.field, f.default)}</span> → ` +
+    `<span class="f">${fieldValLabel(f.field, f.custom)}</span>`
+  ).join("；");
+  return `${d.txn} 第 ${d.op_index} 条 ${esc(opText)}` +
+    `（默认第 ${d.default_seq} 步 ↔ 自定义第 ${d.custom_seq} 步）：${fields}`;
+}
+
+function sideSummaryHtml(title, res) {
+  const g = res.graph;
+  const cyc = g.has_cycle
+    ? `<div style="color:var(--red)">⚠ 依赖图成环：${g.cycles.map(c => esc(c.label)).join("；")}</div>`
+    : `<div style="color:var(--green)">✔ 依赖图无环</div>`;
+  const dirty = res.dirty_reads.length
+    ? `<div style="color:var(--amber)">⚠ 脏读清单 ${res.dirty_reads.length} 条：</div>` +
+      `<ul>${res.dirty_reads.map(d => `<li>第 ${d.read_seq} 步：${esc(d.detail)}</li>`).join("")}</ul>`
+    : `<div style="color:var(--muted)">脏读清单：无</div>`;
+  return `<div class="cmp-side"><div class="st">${title}</div>${cyc}${dirty}</div>`;
+}
+
+function renderCompareSummary() {
+  const box = $("compareSummary");
+  if (!state.cmp) { box.innerHTML = ""; return; }
+  $("cmpOrderText").textContent = state.cmp.order.join(" ");
+  let html = "";
+  for (const m of ["RU", "RC", "SI"]) {
+    const c = state.cmp.compare[m];
+    let diffHtml;
+    if (c.identical) {
+      diffHtml = `<div class="cmp-diff same">✔ 无差异：READ / COMMIT / ABORT 按「事务名 + 事务内操作序号」对齐后，` +
+        `两侧读值、来源类型、写入者与结束状态完全一致。</div>`;
+    } else {
+      diffHtml = `<div class="cmp-diff diff"><strong>首次差异</strong>（依默认轮转悠序）：${diffLine(c.first_diff)}`;
+      if (c.diff_count > 1) {
+        diffHtml += `<details class="cmp-all"><summary>共 ${c.diff_count} 处差异，展开查看全部</summary><ul>` +
+          c.diffs.map(d => `<li>${diffLine(d)}</li>`).join("") + `</ul></details>`;
+      } else {
+        diffHtml += `<div style="margin-top:4px;font-size:11px;opacity:.8">共 1 处差异。</div>`;
+      }
+      diffHtml += `</div>`;
+    }
+    html += `<div class="cmp-card"><h3>${esc(MODE_LABEL[m])}` +
+      `<span class="verdict ${c.identical ? "ok" : "bad"}">${c.identical ? "无差异" : `差异 ${c.diff_count} 处`}</span></h3>` +
+      diffHtml +
+      `<div class="cmp-sides">` +
+      sideSummaryHtml("默认轮转", state.cmp.sides.default.results[m]) +
+      sideSummaryHtml("自定义顺序", state.cmp.sides.custom.results[m]) +
+      `</div></div>`;
+  }
+  box.innerHTML = html;
+}
+
 function stopPlay() {
   if (state.timer) { clearInterval(state.timer); state.timer = null; $("playBtn").textContent = "⏩ 自动播放"; }
 }
 function togglePlay() {
   if (state.timer) { stopPlay(); return; }
-  const n = state.data.results[state.mode].steps.length;
+  const n = result().steps.length;
   if (state.idx >= n - 1) state.idx = 0;
   $("playBtn").textContent = "⏸ 暂停";
   state.timer = setInterval(() => {
@@ -446,14 +669,29 @@ function togglePlay() {
 // 渲染主体
 // ---------------------------------------------------------------------------
 
-function result() { return state.data.results[state.mode]; }
+function currentResults() {
+  if (state.view === "compare" && state.cmp) return state.cmp.sides[state.side].results;
+  return state.data ? state.data.results : null;
+}
+
+function result() { return currentResults()[state.mode]; }
+
+// 对照视图下当前侧首次差异所在的步号（无差异或单跑视图时为 null）
+function firstDiffSeq() {
+  if (state.view !== "compare" || !state.cmp) return null;
+  const fd = state.cmp.compare[state.mode].first_diff;
+  if (!fd) return null;
+  return state.side === "default" ? fd.default_seq : fd.custom_seq;
+}
 
 function render() {
-  if (!state.data) return;
+  if (!currentResults()) return;
   const r = result();
   const n = r.steps.length;
   state.idx = Math.max(0, Math.min(state.idx, n - 1));
-  $("posText").textContent = `第 ${state.idx + 1} / ${n} 步 · ${MODE_RULE[state.mode]}`;
+  const sideTag = state.view === "compare" && state.cmp
+    ? `【${state.side === "default" ? "默认轮转" : "自定义顺序"}】` : "";
+  $("posText").textContent = `${sideTag}第 ${state.idx + 1} / ${n} 步 · ${MODE_RULE[state.mode]}`;
   renderChips(r);
   renderStep(r.steps[state.idx]);
   renderChains(r.steps[state.idx]);
@@ -471,12 +709,14 @@ function opShort(step) {
 function renderChips(r) {
   const box = $("chips");
   box.innerHTML = "";
+  const fdSeq = firstDiffSeq();
   r.steps.forEach((s, i) => {
     const c = document.createElement("div");
     c.className = "chip" + (i < state.idx ? " done" : "") +
       (i === state.idx ? " current" : "") +
       (s.in_cycle ? " cycle" : "") +
-      (s.dirty_candidate ? " dirty" : "");
+      (s.dirty_candidate ? " dirty" : "") +
+      (s.seq === fdSeq ? " firstdiff" : "");
     c.innerHTML = `<span class="cseq">${s.seq}</span>${s.txn} ${esc(opShort(s))}`;
     c.onclick = () => { stopPlay(); state.idx = i; render(); };
     box.appendChild(c);
@@ -496,6 +736,8 @@ function renderStep(step) {
   if (step.in_cycle) (step.cycle_tags || []).forEach(t => tags += `<span class="tag cycle">${esc(t)}</span>`);
   if (step.op === "COMMIT" && step.txn_status_after === "aborted")
     tags += `<span class="tag cycle">SI 回滚</span>`;
+  if (step.seq === firstDiffSeq())
+    tags += `<span class="tag cycle">对照首次差异</span>`;
 
   let inner = `
     <div class="step-top">
@@ -690,13 +932,22 @@ function renderGraph(graph) {
 
 function bind() {
   $("runBtn").onclick = run;
+  $("compareBtn").onclick = runCompare;
+  $("fillOrderBtn").onclick = fillDefaultOrder;
+  $("clearOrderBtn").onclick = () => { $("orderInput").value = ""; };
+  document.querySelectorAll(".order-add").forEach(b => {
+    b.onclick = () => {
+      const el = $("orderInput");
+      el.value = (el.value.trim() ? el.value.trim() + " " : "") + b.dataset.name;
+    };
+  });
   $("enableT3").onchange = e => { $("t3box").style.display = e.target.checked ? "" : "none"; };
   $("prevBtn").onclick = () => { stopPlay(); state.idx--; render(); };
   $("nextBtn").onclick = () => { stopPlay(); state.idx++; render(); };
   $("resetBtn").onclick = () => { stopPlay(); state.idx = 0; render(); };
   $("playBtn").onclick = togglePlay;
   document.addEventListener("keydown", e => {
-    if (!state.data || e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+    if (!currentResults() || e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
     if (e.key === "ArrowLeft") { stopPlay(); state.idx--; render(); }
     if (e.key === "ArrowRight") { stopPlay(); state.idx++; render(); }
   });

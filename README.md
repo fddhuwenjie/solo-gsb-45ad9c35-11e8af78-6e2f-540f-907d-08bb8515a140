@@ -22,6 +22,10 @@
   - `RW`（反依赖）：Ti 读过某版本**之后**，同键才有 Tj 提交的新版本（Ti → Tj；只读时已经提交的版本，即使版本编号更大，也不构成反依赖）；
   - 图中发现环时，环上的边与对应的读/写操作红色高亮；
 - 单列「**脏读清单**」：读到后来被 ABORT 的未提交数据；
+- **调度对照**：输入由 T1/T2/T3 组成的自定义执行顺序（每项取对应事务尚未执行的队头操作），
+  与默认轮转各自独立运行 RU / RC / SI，按「事务名 + 事务内操作序号」对齐 READ / COMMIT / ABORT，
+  依默认轮转的步序标出读值、来源类型、写入者与结束状态的**首次差异**（无差异也会明确标示），
+  并并排展示两侧的脏读清单与依赖图成环情况；页面可切换回看两侧逐步轨迹；
 - 内置四个一键加载示例：脏读、丢失更新（对比 RC 提交成环与 SI 回滚）、写偏序（SI 下双双提交但 RW 成环）、同键交错提交（见下）。
 
 ## 交错示例：同键先写者晚提交（RC 按提交顺序取版本）
@@ -119,3 +123,31 @@ uvicorn app.main:app --reload --port 8000
 
 返回三种隔离级别各自的 `steps`（含每步版本链快照、读值来源、事务状态）、
 `dirty_reads` 与 `graph`（节点 / WR·WW·RW 边 / 环路径）。
+
+### 调度对照接口
+
+`POST /api/compare` —— 同一组脚本分别按**默认轮转**与**自定义顺序**各跑 RU / RC / SI 并对齐比较：
+
+```bash
+curl -s -X POST http://localhost:8000/api/compare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "initial": "x=0",
+    "txns": [
+      "BEGIN\nREAD x\nWRITE x 10\nCOMMIT",
+      "BEGIN\nREAD x\nWRITE x 20\nCOMMIT"
+    ],
+    "order": "T2 T2 T2 T2 T1 T1 T1 T1"
+  }'
+```
+
+- `order` 为 T1/T2/T3 组成的完整执行顺序（空格/逗号分隔的字符串，或数组
+  `["T2","T2",...]`），每项取对应事务尚未执行的队头操作；
+  每个事务出现的次数必须恰好等于其脚本操作数——出现未知事务或次数不符时返回 400；
+- 响应中 `sides.default` / `sides.custom` 为两侧完整推演结果（结构同 `/api/simulate` 的
+  `results`，含 `steps` / `dirty_reads` / `graph`），可直接回看两侧逐步轨迹；
+- `compare.{RU,RC,SI}` 给出对照结论：按「事务名 + 事务内操作序号」对齐 READ / COMMIT / ABORT，
+  依默认轮转的步序得到 `first_diff`（读值 / 来源类型 / 写入者 / 结束状态的首次差异，
+  含两侧步号 `default_seq` / `custom_seq`）、全部 `diffs` 与 `identical` 标记，
+  以及两侧脏读数量与依赖图成环情况的 `summary`；
+  SI 因顺序变化回滚时，后续读值、版本链与依赖图均以各侧实际运行结果为准。
