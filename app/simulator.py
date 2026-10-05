@@ -6,10 +6,16 @@
 
 全局调度规则：从各事务队头依次取一条操作（轮转调度，事务结束后跳过），
 三种隔离级别共用同一份调度，保证差异只来自隔离语义。
+
+调度对照：调用方可给定由事务名组成的完整执行顺序（每次取对应事务尚未
+执行的队头操作），与默认轮转顺序分别独立推演 RU / RC / SI，再按
+(事务名, 事务内操作序号) 对齐 READ / COMMIT / ABORT，依默认轮转的步序
+找出读值、来源类型、写入者或结束状态的首个差异。
 """
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -175,6 +181,22 @@ def build_schedule(txns: List[Txn]) -> List[Tuple[str, Tuple[str, Optional[str],
     return schedule
 
 
+def build_custom_schedule(txns: List[Txn], order: List[str]) -> List[Tuple[str, Tuple[str, Optional[str], Optional[Any]]]]:
+    """自定义顺序调度：按给定事务名序列，每次取对应事务尚未执行的队头操作。"""
+    by_name = {t.name: t for t in txns}
+    schedule: List[Tuple[str, Tuple[str, Optional[str], Optional[Any]]]] = []
+    for name in order:
+        t = by_name[name]
+        if t.pc >= len(t.ops):
+            raise SimError(f"执行顺序中 {name} 的出现次数超过其脚本操作数")
+        schedule.append((t.name, t.ops[t.pc]))
+        t.pc += 1
+    for t in txns:
+        if t.pc < len(t.ops):
+            raise SimError(f"执行顺序未覆盖 {t.name} 的全部 {len(t.ops)} 条操作")
+    return schedule
+
+
 def _initial_version(vid: int, key: str, value: Any) -> Version:
     return Version(vid=vid, key=key, value=value, kind="initial",
                    writer="INIT", wseq=None, cseq=0)
@@ -271,8 +293,12 @@ def _snapshot_dict(t: Txn) -> Dict[str, dict]:
 
 def simulate(mode: str,
              initial: "OrderedDict[str, Any]",
-             txn_scripts: List[Tuple[str, str]]) -> dict:
-    """对单个隔离级别执行完整推演。"""
+             txn_scripts: List[Tuple[str, str]],
+             order: Optional[List[str]] = None) -> dict:
+    """对单个隔离级别执行完整推演。
+
+    order 为 None 时使用默认轮转调度；否则按给定事务名顺序取各事务队头操作。
+    """
     if mode not in ("RU", "RC", "SI"):
         raise SimError(f"未知隔离级别 {mode}")
 
@@ -281,7 +307,10 @@ def simulate(mode: str,
         txns[name] = Txn(name=name, ops=parse_txn(name, text))
     txn_list = list(txns.values())
 
-    schedule = build_schedule(txn_list)
+    if order is None:
+        schedule = build_schedule(txn_list)
+    else:
+        schedule = build_custom_schedule(txn_list, order)
 
     # 重置调度游标造成的状态：Txn 刚构造时 pc 已被 build_schedule 推到末尾，
     # 重新初始化一个干净的执行环境。
@@ -816,4 +845,176 @@ def run_all(initial_text: str, txn_texts: List[str]) -> dict:
         "initial": {k: v for k, v in initial.items()},
         "results": {mode: simulate(mode, initial, txn_scripts)
                     for mode in ("RU", "RC", "SI")},
+    }
+
+
+# ---------------------------------------------------------------------------
+# 调度对照：自定义执行顺序 vs 默认轮转
+# ---------------------------------------------------------------------------
+
+_ORDER_SEPARATORS = re.compile(r"[\s,，;；、→>\-]+")
+
+
+def normalize_order(order: List[str], txn_scripts: List[Tuple[str, str]]) -> List[str]:
+    """校验并规范化自定义执行顺序。
+
+    每个元素可包含一个或多个事务名（空白 / 逗号等分隔，大小写不敏感）；
+    出现未知事务名、或某事务出现次数与其脚本操作数不符时抛出 SimError。
+    """
+    names = [n for n, _ in txn_scripts]
+    norm: List[str] = []
+    for raw in order:
+        for tok in _ORDER_SEPARATORS.split(str(raw)):
+            tok = tok.strip()
+            if not tok:
+                continue
+            name = tok.upper()
+            if name not in names:
+                raise SimError(
+                    f"执行顺序包含未知事务 “{tok}”（当前事务只有 {'、'.join(names)}）"
+                )
+            norm.append(name)
+    if not norm:
+        raise SimError("执行顺序不能为空")
+    counts = {n: 0 for n in names}
+    for n in norm:
+        counts[n] += 1
+    for name, text in txn_scripts:
+        expect = len(parse_txn(name, text))
+        got = counts[name]
+        if got != expect:
+            raise SimError(
+                f"执行顺序中 {name} 出现 {got} 次，但其脚本共有 {expect} 条操作；"
+                "每个事务的出现次数必须与脚本操作数一致"
+            )
+    return norm
+
+
+def _aligned_steps(steps: List[dict]) -> List[Tuple[str, int, dict]]:
+    """为每步补上对齐键 (事务名, 事务内操作序号)：事务第 n 次出现即其第 n 条操作。"""
+    counters: Dict[str, int] = {}
+    aligned: List[Tuple[str, int, dict]] = []
+    for s in steps:
+        counters[s["txn"]] = counters.get(s["txn"], 0) + 1
+        aligned.append((s["txn"], counters[s["txn"]], s))
+    return aligned
+
+
+def _read_view(s: dict) -> dict:
+    return {
+        "read_value": s["read_value"],
+        "read_source": s["read_source"],
+        "read_writer": s["read_writer"],
+        "read_vid": s["read_vid"],
+    }
+
+
+_SOURCE_CN = {
+    "initial": "初始值",
+    "committed": "最新已提交版本",
+    "dirty": "其他事务未提交的写入（脏读）",
+    "snapshot": "BEGIN 快照",
+    "own": "本事务自身写入",
+    "missing": "无此键",
+}
+_STATUS_CN = {"pending": "未开始", "active": "活跃中",
+              "committed": "已提交", "aborted": "已回滚"}
+
+
+def _writer_cn(writer: Optional[str]) -> str:
+    if writer is None:
+        return "无"
+    return "初始数据" if writer == "INIT" else writer
+
+
+def _diff_detail(d: dict) -> str:
+    head = f"{d['txn']} 第 {d['op_index']} 条 {d['op']}"
+    if d["kind"] == "read":
+        dv, cv = d["default"], d["custom"]
+        return (
+            f"{head}（READ {d['key']}）：默认轮转第 {d['default_seq']} 步读到 "
+            f"{_fmt(dv['read_value'])}（{_SOURCE_CN.get(dv['read_source'], dv['read_source'])}，"
+            f"写入者 {_writer_cn(dv['read_writer'])}）；自定义顺序第 {d['custom_seq']} 步读到 "
+            f"{_fmt(cv['read_value'])}（{_SOURCE_CN.get(cv['read_source'], cv['read_source'])}，"
+            f"写入者 {_writer_cn(cv['read_writer'])}）"
+        )
+    return (
+        f"{head}：默认轮转第 {d['default_seq']} 步后"
+        f"{_STATUS_CN.get(d['default']['status'], d['default']['status'])}，"
+        f"自定义顺序第 {d['custom_seq']} 步后"
+        f"{_STATUS_CN.get(d['custom']['status'], d['custom']['status'])}"
+    )
+
+
+def compare_results(default_res: dict, custom_res: dict) -> dict:
+    """按 (事务名, 事务内操作序号) 对齐 READ / COMMIT / ABORT，依默认侧步序找差异。
+
+    READ 比较读值、来源类型与写入者；COMMIT / ABORT 比较结束状态
+    （SI 下 COMMIT 可能因首提交者胜而整笔回滚）。两侧独立推演，
+    后续读值、版本链与依赖图均以各侧实际运行结果为准。
+    """
+    custom_by_key = {
+        (txn, idx): s for txn, idx, s in _aligned_steps(custom_res["steps"])
+    }
+    diffs: List[dict] = []
+    for txn, idx, ds in _aligned_steps(default_res["steps"]):
+        op = ds["op"]
+        if op not in ("READ", "COMMIT", "ABORT"):
+            continue
+        cs = custom_by_key[(txn, idx)]
+        base = {
+            "txn": txn, "op_index": idx, "op": op, "key": ds["key"],
+            "default_seq": ds["seq"], "custom_seq": cs["seq"],
+        }
+        if op == "READ":
+            if _read_view(ds) == _read_view(cs):
+                continue
+            diffs.append({**base, "kind": "read",
+                          "default": _read_view(ds), "custom": _read_view(cs)})
+        else:
+            if ds["txn_status_after"] == cs["txn_status_after"]:
+                continue
+            diffs.append({**base, "kind": "end_status",
+                          "default": {"status": ds["txn_status_after"]},
+                          "custom": {"status": cs["txn_status_after"]}})
+    for d in diffs:
+        d["detail"] = _diff_detail(d)
+    return {
+        "identical": not diffs,
+        "diff_count": len(diffs),
+        "first_diff": diffs[0] if diffs else None,
+        "diffs": diffs,
+        "dirty_reads": {
+            "default": default_res["dirty_reads"],
+            "custom": custom_res["dirty_reads"],
+        },
+        "graph": {
+            "default_has_cycle": default_res["graph"]["has_cycle"],
+            "custom_has_cycle": custom_res["graph"]["has_cycle"],
+            "default_cycles": default_res["graph"]["cycles"],
+            "custom_cycles": custom_res["graph"]["cycles"],
+        },
+    }
+
+
+def run_compare(initial_text: str, txn_texts: List[str], order: List[str]) -> dict:
+    """同一组事务脚本：默认轮转顺序与自定义顺序分别独立推演 RU / RC / SI 并对照。"""
+    initial = parse_initial(initial_text)
+    if not 2 <= len(txn_texts) <= 3:
+        raise SimError("需要 2~3 条事务脚本")
+    txn_scripts = [(f"T{i+1}", text) for i, text in enumerate(txn_texts)]
+    norm_order = normalize_order(order, txn_scripts)
+    default_results = {m: simulate(m, initial, txn_scripts)
+                       for m in ("RU", "RC", "SI")}
+    custom_results = {m: simulate(m, initial, txn_scripts, order=norm_order)
+                      for m in ("RU", "RC", "SI")}
+    return {
+        "initial": {k: v for k, v in initial.items()},
+        "order": norm_order,
+        "default": {"label": "默认轮转顺序", "results": default_results},
+        "custom": {"label": "自定义顺序", "results": custom_results},
+        "comparison": {
+            m: compare_results(default_results[m], custom_results[m])
+            for m in ("RU", "RC", "SI")
+        },
     }
